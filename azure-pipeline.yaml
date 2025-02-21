@@ -1,0 +1,146 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - vumatel-terragrunt/terragrunt/b2c/accounts/vumatel-b2c-preprod/*
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - template: ./azure-pipeline-vars.yml
+
+stages:
+  - stage: DetectChanges
+    displayName: "Detect Changed Directories"
+    jobs:
+      - job: Detect
+        displayName: "Identify Changed Directories"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - script: |
+              echo "Identifying changed directories..."
+              git fetch origin main
+              CHANGED_FILES=$(git diff --name-only origin/main...HEAD)
+              CHANGED_DIRS=$(echo "$CHANGED_FILES" | grep -E '^${{variables.directory}}' | xargs -I{} dirname {} | sort | uniq)
+              echo "##vso[task.setvariable variable=CHANGED_DIRS]$CHANGED_DIRS"
+              if [ -z "$CHANGED_DIRS" ]; then
+                echo "No changes detected in relevant directories."
+                exit 0
+              fi
+              echo "Changed directories:"
+              echo "$CHANGED_DIRS"
+            displayName: "Identify Changed Directories"
+            workingDirectory: $(System.DefaultWorkingDirectory)/terragrunt
+
+  - stage: Plan
+    displayName: "Terragrunt Plan"
+    dependsOn: DetectChanges
+    condition: and(succeeded(), ne(variables['CHANGED_DIRS'], ''))
+    jobs:
+      - job: Plan
+        displayName: "Run Terragrunt Plan"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - script: |
+              CHANGED_DIRS=$(echo "$(CHANGED_DIRS)")
+              echo "Running Terragrunt plan for changed directories..."
+              for DIR in $CHANGED_DIRS; do
+                echo "Planning for directory: $DIR"
+                cd $DIR
+                terragrunt plan -out=plan.out > plan_output.txt
+                echo "Plan for $DIR complete. Output saved to plan_output.txt."
+                cd -
+              done
+            displayName: "Run Terragrunt Plan and Save Outputs"
+
+          - script: |
+              echo "Preparing PR comments..."
+              CHANGED_DIRS=$(echo "$(CHANGED_DIRS)")
+              COMMENT="The following directories have changed:\n\n$(echo "$CHANGED_DIRS" | sed 's/^/- /')"
+              echo $COMMENT > directories.txt
+              
+              for DIR in $CHANGED_DIRS; do
+                echo "\n---\n**Plan Output for $DIR:**\n" >> plan_comment.txt
+                cat $DIR/plan_output.txt >> plan_comment.txt
+              done
+            displayName: "Prepare PR Comments with Plan Outputs"
+
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: $(azureSubscription)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                ORG_URL=https://vumatel.visualstudio.com/
+                PROJECT=${{variables.project_name}}
+                REPO_ID=${{variables.repo_id}}
+                PR_ID=$(System.PullRequest.PullRequestId)
+                API_URL="$ORG_URL/$PROJECT/_apis/git/repositories/$REPO_ID/pullRequests/$PR_ID/threads?api-version=7.1-preview.1"
+                
+                COMMENT=$(cat directories.txt)
+                PLAN_COMMENT=$(cat plan_comment.txt)
+
+                echo "Posting comment with changed directories..."
+                curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $(System.AccessToken)" \
+                  -d "{\"comments\": [{\"content\": \"$COMMENT\", \"commentType\": \"text\"}]}" $API_URL
+
+                echo "Posting comment with plan outputs..."
+                curl -X POST -H "Content-Type: application/json" -H "Authorization: Bearer $(System.AccessToken)" \
+                  -d "{\"comments\": [{\"content\": \"$PLAN_COMMENT\", \"commentType\": \"text\"}]}" $API_URL
+            env:
+              System.AccessToken: $(System.AccessToken)
+            displayName: "Post PR Comments"
+
+  - stage: ManualApproval
+    displayName: "Manual Approval"
+    dependsOn: Plan
+    condition: succeeded()
+    jobs:
+      - job: Approval
+        displayName: "Manual Approval"
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: ManualValidation@1
+            inputs:
+              notifyUsers: 'bradley.pirie@vumatel.co.za'
+              instructions: 'Review the Terragrunt plans and approve to apply changes.'
+
+  - stage: Apply
+    displayName: "Apply Terragrunt Changes"
+    dependsOn: ManualApproval
+    condition: and(succeeded(), eq(dependencies.ManualApproval.result, 'Approved'))
+    jobs:
+      - job: Apply
+        displayName: "Apply Terragrunt Changes"
+        variables:
+          - group: terragrunt-variable-group
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - script: |
+              CHANGED_DIRS=$(echo "$(CHANGED_DIRS)")
+              for DIR in $CHANGED_DIRS; do
+                echo "Applying changes for directory: $DIR"
+                cd $DIR
+                ACCOUNT_ID=$(grep -oP '(?<=account_id = ")[^"]+' account.hcl)
+                echo "Account ID: $ACCOUNT_ID"
+                export AWS_ACCESS_KEY_ID=$(echo "$(secrets.AWS_ACCESS_KEY)")
+                export AWS_SECRET_ACCESS_KEY=$(echo "$(secrets.AWS_SECRET_KEY)")
+                if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+                  echo "Error: Missing AWS credentials for Account ID: $ACCOUNT_ID"
+                  exit 1
+                fi
+                terragrunt apply -auto-approve
+                cd -
+              done
+            displayName: "Run Terragrunt Apply Using Secrets"

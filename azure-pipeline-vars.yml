@@ -1,0 +1,4 @@
+variables:
+  project_name: Infrastructure
+  repo_id: a56b46dc-d15b-452d-8662-18b62ddcd542
+  directory:  b2c/accounts/vumatel-b2c-preprod/
